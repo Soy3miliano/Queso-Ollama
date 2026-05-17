@@ -128,7 +128,7 @@ tests/
 
 # 👥 Autores
 
-- Emiliano Montalvo, Andrés Guzmán, Algo Galván, Diego Huitron
+- Emiliano Montalvo, Andrés Guzmán, Aldo Galván, Diego Huitron
 - Queso-Ollama
 - ITESM
 
