@@ -1,0 +1,4 @@
+env/
+chroma_db_medico/
+__pycache__/
+*.pdf
