@@ -3,10 +3,10 @@
   <img src="assets/TARS.png" width="200"/>
 </p>
 
-<h1 align="center">Nombre del Proyecto</h1>
+<h1 align="center">TARS</h1>
 
 <p align="center">
-  Breve descripción poderosa y profesional del proyecto.
+  Asistente Médico Local-Guadalahacks.
 </p>
 
 <p align="center">
