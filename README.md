@@ -1,6 +1,6 @@
 # Queso-Ollama
 <p align="center">
-  <img src="assets/logo.png" width="200"/>
+  <img src="assets/TARS.png" width="200"/>
 </p>
 
 <h1 align="center">Nombre del Proyecto</h1>
