@@ -1,13 +1,15 @@
+from importlib.abc import Loader
+
 import streamlit as st
 import os
 import json
 import re
 import logging
-from datetime import datetime, time
+from datetime import datetime
 from typing import Optional
 
 import ollama
-from langchain_community.document_loaders import PyPDFDire  storyLoader
+from langchain_community.document_loaders import PyPDFDirectoryLoader
 from langchain_text_splitters import RecursiveCharacterTextSplitter
 from langchain_community.vectorstores import Chroma
 from langchain_community.embeddings import OllamaEmbeddings
@@ -19,6 +21,20 @@ from langchain_core.output_parsers import StrOutputParser
 from drug_database import get_drug, get_all_modelable, DRUG_DB
 from pharma_model import simulate_single_dose, find_optimal_interval, half_life
 from notifier import schedule_reminders, cancel_all, list_active
+
+from history_manager import (
+    new_session,
+    get_or_create_session,
+    save_message,
+    get_context,
+    get_context_string,
+    get_session_history,
+    list_sessions,
+    delete_session,
+    export_session,
+    search_history,
+    delete_all_history,
+)
 
 # Configuración general
 logging.basicConfig(level=logging.WARNING)
@@ -46,8 +62,15 @@ _DURATION_KEYWORDS = [
 
 # --- CONFIGURACIÓN VISUAL ---
 st.set_page_config(page_title="Asistente Médico Offline", page_icon="⚕️")
-st.title("⚕️ Asistente Médico Local - GuadalaHacks")
+st.title("⚕️ Asistente Médico Local")
 st.caption("Consultas basadas estrictamente en la bibliografía local (100% Offline)")
+
+# Inicialización de sesión
+if "session_id" not in st.session_state:
+    st.session_state.session_id = new_session()
+
+if "mensajes" not in st.session_state:
+    st.session_state.mensajes = []
 
 # --- MOTOR DE PROCESAMIENTO RAG ---
 @st.cache_resource
@@ -108,14 +131,17 @@ CRITICAL RULES:
 2. Answer the Question in Spanish using ONLY the words from the text.
 3. DO NOT invent medical terms. DO NOT translate. 
 4. If the exact answer is not in the Context, you MUST output exactly: "No tengo información en la bibliografía proporcionada."
- 
+
+-- Recent History --
+{history}
+
 Context:
 {context}
  
 Question: {question}
 Answer in Spanish:"""
  
-    PROMPT = PromptTemplate(template=prompt_template, input_variables=["context", "question"])
+    PROMPT = PromptTemplate(template=prompt_template, input_variables=["history, context", "question"])
  
     def format_docs(docs):
         return "\n\n".join(doc.page_content for doc in docs)
@@ -126,7 +152,8 @@ Answer in Spanish:"""
     )
  
     qa_chain = (
-        {"context": retriever | format_docs, "question": RunnablePassthrough()}
+        {"context": (lambda x: x["question"]) | retriever | format_docs, "question": lambda x: x["question"],
+            "history":  lambda x: x.get("history", "Sin historial previo."),}
         | PROMPT
         | llm
         | StrOutputParser()
@@ -311,15 +338,20 @@ for mensaje in st.session_state.mensajes:
     with st.chat_message(mensaje["role"]):
         st.markdown(mensaje["content"])
 
-tab_rag, tab_pk = st.tabs(["📖 Consulta Bibliográfica", "💊 Dosificación Óptima"])
+tab_rag, tab_pk, tab_hist = st.tabs(["📖 Consulta Bibliográfica", "💊 Dosificación Óptima", "📋 Mi Historial"])
 
 with tab_rag:
     st.subheader("Chat bibliográfico")
     st.caption("Pregunta usando la bibliografía local o consulta al modelo local si no hay indexado.")
 
+    for mensaje in st.session_state.mensajes:
+        with st.chat_message(mensaje["role"]):
+            st.markdown(mensaje["content"])
+
     prompt = st.chat_input("Consulta un síntoma, protocolo o historial...")
 
     if prompt:
+        save_message(st.session_state.session_id, "user", prompt, msg_type="rag")
         st.session_state.mensajes.append({"role": "user", "content": prompt})
         with st.chat_message("user"):
             st.markdown(prompt)
@@ -328,7 +360,14 @@ with tab_rag:
             if qa_chain is not None:
                 with st.spinner("Buscando en la bibliografía médica..."):
                     try:
-                        texto_final = qa_chain.invoke(prompt)
+                        history_str = get_context_string(
+                            st.session_state.session_id,
+                            max_turns=6,
+                        )
+                        texto_final = qa_chain.invoke({
+                            "question": prompt,
+                            "history": history_str or "Sin historial previo."
+                        })
                         st.markdown(texto_final)
                         st.session_state.mensajes.append({"role": "assistant", "content": texto_final})
                     except Exception as e:
@@ -337,7 +376,17 @@ with tab_rag:
                 with st.spinner("Consultando modelo local..."):
                     try:
                         from ia_local import consultar_modelo
-
+                        history_msgs = get_context(st.session_state.session_id, max_turns=6)
+                        history_msgs.append({"role": "user", "content": prompt})
+                        resp        = ollama.chat(model=MODEL_NAME, messages=history_msgs)
+                        texto_final = resp["message"]["content"]
+                        st.markdown(texto_final)
+                        save_message(
+                            st.session_state.session_id,
+                            "assistant",
+                            texto_final,
+                            msg_type="rag",
+                        )
                         texto_final = consultar_modelo(prompt)
                         st.markdown(texto_final)
                         st.session_state.mensajes.append({"role": "assistant", "content": texto_final})
@@ -414,4 +463,96 @@ with tab_pk:
             st.success(f"🔔 Recordatorios programados cada {resultado['optimal_interval_h']} h")
             if first_dose_time is not None:
                 st.info(f"Horario base tomado: {first_dose_time.strftime('%H:%M')}")
+            st.rerun()
+    
+    
+    st.divider()
+
+    st.subheader("🕘 Sesiones guardadas")
+    st.caption(f"Sesión activa: {st.session_state.session_id[:8]}...")
+
+    if st.button("➕ Nueva sesión"):
+        st.session_state.session_id = new_session()
+        st.session_state.mensajes   = []
+        st.rerun()
+
+    sessions = list_sessions(limit=8)
+    if sessions:
+        for s in sessions:
+            if s["session_id"] == st.session_state.session_id:
+                continue
+            ts    = s["updated_at"][:16].replace("T", " ")
+            label = f"{ts} ({s['n_messages']} msgs)"
+            with st.expander(label):
+                st.caption(f"ID: {s['session_id'][:8]}...")
+                col1, col2 = st.columns(2)
+                if col1.button("📂 Cargar", key=f"load_{s['session_id']}"):
+                    st.session_state.session_id = s["session_id"]
+                    hist = get_session_history(s["session_id"])
+                    st.session_state.mensajes = [
+                        {"role": m["role"], "content": m["content"]}
+                        for m in hist
+                        if m["role"] in ("user", "assistant")
+                    ]
+                    st.rerun()
+                if col2.button("🗑️ Borrar", key=f"del_{s['session_id']}"):
+                    delete_session(s["session_id"])
+                    st.rerun()
+    else:
+        st.caption("Sin sesiones previas")
+
+    st.divider()
+
+    with st.expander("🔍 Buscar en historial"):
+        kw = st.text_input("Palabra clave", placeholder="ej. fiebre, amoxicilina")
+        if kw:
+            resultados = search_history(kw, limit=5)
+            if resultados:
+                for r in resultados:
+                    icon = "👤" if r["role"] == "user" else "🤖"
+                    st.markdown(f"{icon} {r['timestamp'][:16]} · {r['content'][:100]}...")
+            else:
+                st.caption("Sin resultados.")
+
+    with st.expander("📤 Exportar sesión actual"):
+        fmt = st.selectbox("Formato", ["json", "text"])
+        if st.button("Exportar"):
+            content = export_session(st.session_state.session_id, fmt=fmt)
+            ext     = "json" if fmt == "json" else "txt"
+            st.download_button(
+                "⬇️ Descargar",
+                data=content,
+                file_name=f"tars_{st.session_state.session_id[:8]}.{ext}",
+            )
+
+with tab_hist:
+    st.subheader("📋 Historial de esta sesión")
+    st.caption(f"Sesión: {st.session_state.session_id}")
+
+    hist = get_session_history(st.session_state.session_id)
+
+    if not hist:
+        st.info("Aún no hay mensajes en esta sesión.")
+    else:
+        st.metric("Total de mensajes", len(hist))
+
+        tipos    = ["todos", "rag", "pk_analysis"]
+        tipo_sel = st.selectbox("Filtrar por tipo", tipos)
+
+        for m in hist:
+            if tipo_sel != "todos" and m.get("msg_type") != tipo_sel:
+                continue
+            icon = "👤" if m["role"] == "user" else "🤖"
+            ts   = m["timestamp"][:16].replace("T", " ")
+            with st.expander(f"{icon} [{ts}] — {m['content'][:60]}..."):
+                st.markdown(m["content"])
+                if m.get("drug_context"):
+                    st.json(m["drug_context"])
+                st.caption(f"Tipo: {m.get('msg_type', '—')} · Rol: {m['role']}")
+
+        st.divider()
+        if st.button("🗑️ Limpiar esta sesión", type="secondary"):
+            delete_session(st.session_state.session_id)
+            st.session_state.session_id = new_session()
+            st.session_state.mensajes   = []
             st.rerun()
