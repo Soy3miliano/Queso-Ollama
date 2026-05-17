@@ -81,7 +81,7 @@ Procesamiento de señales.
 Clasificación mediante IA.
 
 ## Paso 4
-Respuesta del sistema.
+Respuesta del sistema
 
 ---
 
